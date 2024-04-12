@@ -1,83 +1,4 @@
 import json
-from datamodel import Order, ProsperityEncoder, Symbol, TradingState, Trade
-from typing import Any
-
-class Logger:
-    # Set this to true, if u want to create
-    # local logs
-    local: bool 
-    # this is used as a buffer for logs
-    # instead of stdout
-    local_logs: dict[int, str] = {}
-
-    def __init__(self, local=False) -> None:
-        self.logs = ""
-        self.local = local
-
-    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
-        self.logs += sep.join(map(str, objects)) + end
-
-    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]]) -> None:
-        output = json.dumps({
-            "state": state,
-            "orders": orders,
-            "logs": self.logs,
-        }, cls=ProsperityEncoder, separators=(",", ":"), sort_keys=True)
-        if self.local:
-            self.local_logs[state.timestamp] = output
-        print(output)
-
-        self.logs = ""
-
-    def compress_state(self, state: TradingState) -> dict[str, Any]:
-        listings = []
-        for listing in state.listings.values():
-            listings.append([listing["symbol"], listing["product"], listing["denomination"]])
-
-        order_depths = {}
-        for symbol, order_depth in state.order_depths.items():
-            order_depths[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
-
-        return {
-            "t": state.timestamp,
-            "l": listings,
-            "od": order_depths,
-            "ot": self.compress_trades(state.own_trades),
-            "mt": self.compress_trades(state.market_trades),
-            "p": state.position,
-            "o": state.observations,
-        }
-
-    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
-        compressed = []
-        for arr in trades.values():
-            for trade in arr:
-                compressed.append([
-                    trade.symbol,
-                    trade.buyer,
-                    trade.seller,
-                    trade.price,
-                    trade.quantity,
-                    trade.timestamp,
-                ])
-
-        return compressed
-
-    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
-        compressed = []
-        for arr in orders.values():
-            for order in arr:
-                compressed.append([order.symbol, order.price, order.quantity])
-
-        return compressed
-
-# This is provisionary, if no other algorithm works.
-# Better to loose nothing, then dreaming of a gain.
-from collections import deque
-from typing import List
-
-
-import json
 from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
 from typing import Any
 
@@ -186,33 +107,45 @@ class Logger:
 
 logger = Logger()
 
-from datamodel import OrderDepth, UserId, TradingState, Order
+from datamodel import OrderDepth, Order, TradingState
+from typing import List, Tuple, Dict
+
 from typing import List
-from collections import deque
+
 
 class Trader:
     POSITION_LIMIT = 20  # The maximum absolute value of the position
     STOP_LOSS_THRESHOLD = 9500  # Set a stop-loss threshold for AMETHYSTS
-    PRICE_WINDOW_SIZE = 10  # Size of the window for calculating the average price
+    FORECAST_WINDOW_SIZE = 500  # Number of timestamps to use for forecasting
+    SHORT_TERM_SMA_WINDOW = 50  # Short-term SMA window
+    LONG_TERM_SMA_WINDOW = 200  # Long-term SMA window
 
     def __init__(self):
         self.threshold_prices = {
             'AMETHYSTS': {
-                'buy': 9990,
-                'sell': 10000
+                'buy': 8500,
+                'sell': 11000
+            },
+            'STARFRUIT': {
+                'buy': 4980,
+                'sell': 5000
             }
         }
-        self.price_history = {
-            'STARFRUIT': deque()
-        }
+        self.starfruit_prices = []
+
+    def calculate_sma(self, prices, window):
+        if len(prices) < window:
+            return None
+        return sum(prices[-window:]) / window
 
     def run(self, state: TradingState):
-        print("traderData: " + state.traderData)
-        print("Observations: " + str(state.observations))
         result = {}
 
-        # Update the price history for STARFRUIT
-        self.update_price_history(state, 'STARFRUIT')
+        # Check if traderData attribute exists in TradingState
+        if hasattr(state, 'traderData'):
+            print("traderData: " + state.traderData)
+        else:
+            print("traderData attribute not found in TradingState")
 
         # Process AMETHYSTS
         if 'AMETHYSTS' in state.order_depths:
@@ -250,45 +183,45 @@ class Trader:
             order_depth: OrderDepth = state.order_depths['STARFRUIT']
             starfruit_orders: List[Order] = []
             current_position = state.position.get('STARFRUIT', 0)  # Get the current position for STARFRUIT
-
-            # Calculate the average price and set the buy and sell thresholds
-            avg_price = self.calculate_average_price('STARFRUIT')
-            buy_threshold = avg_price - 100  # Buy if the price is 100 below the average
-            sell_threshold = avg_price + 100  # Sell if the price is 100 above the average
+            buy_threshold = self.threshold_prices['STARFRUIT']['buy']
+            sell_threshold = self.threshold_prices['STARFRUIT']['sell']
 
             # Extract the best bid and best ask
             best_bid = max(order_depth.buy_orders, key=lambda price: int(price), default=None)
             best_ask = min(order_depth.sell_orders, key=lambda price: int(price), default=None)
 
-            # Decide whether to buy or sell based on the threshold prices and position limit
-            if best_ask and int(best_ask) < buy_threshold:
-                best_ask_amount = order_depth.sell_orders[best_ask]
-                buy_amount = min(best_ask_amount, self.POSITION_LIMIT - current_position)  # Do not exceed position limit
-                if buy_amount > 0:
-                    starfruit_orders.append(Order('STARFRUIT', best_ask, buy_amount))
+            # Add current price to historical data for STARFRUIT
+            current_price = int(best_bid) if best_bid else int(best_ask)
+            self.starfruit_prices.append(current_price)
 
-            elif best_bid and int(best_bid) > sell_threshold:
-                best_bid_amount = order_depth.buy_orders[best_bid]
-                sell_amount = min(best_bid_amount, self.POSITION_LIMIT + current_position)  # Do not exceed position limit
-                if sell_amount > 0:
-                    starfruit_orders.append(Order('STARFRUIT', best_bid, -sell_amount))
+            # Calculate short-term and long-term SMAs
+            short_term_sma = self.calculate_sma(self.starfruit_prices, self.SHORT_TERM_SMA_WINDOW)
+            long_term_sma = self.calculate_sma(self.starfruit_prices, self.LONG_TERM_SMA_WINDOW)
+
+            # Determine trend based on SMAs
+            if short_term_sma and long_term_sma:
+                if short_term_sma > long_term_sma:
+                    # print("STARFRUIT is trending upward (Bullish)")
+                    # Implement your buying logic here based on the upward trend
+                    if best_ask and int(best_ask) < buy_threshold:
+                        best_ask_amount = order_depth.sell_orders[best_ask]
+                        buy_amount = min(best_ask_amount,
+                                         self.POSITION_LIMIT - current_position)  # Do not exceed position limit
+                        if buy_amount > 0:
+                            starfruit_orders.append(Order('STARFRUIT', best_ask, buy_amount))
+
+                elif short_term_sma < long_term_sma:
+                    # print("STARFRUIT is trending downward (Bearish)")
+                    # Implement your selling logic here based on the downward trend
+                    if best_bid and int(best_bid) > sell_threshold:
+                        best_bid_amount = order_depth.buy_orders[best_bid]
+                        sell_amount = min(best_bid_amount,
+                                          self.POSITION_LIMIT + current_position)  # Do not exceed position limit
+                        if sell_amount > 0:
+                            starfruit_orders.append(Order('STARFRUIT', best_bid, -sell_amount))
 
             result['STARFRUIT'] = starfruit_orders
 
         # Update the trader state data if needed
-        traderData = "SAMPLE"
         conversions = None  # Placeholder for conversions value
-        return result, conversions, traderData
-
-    def update_price_history(self, state, symbol):
-        if "market_trades" in state.market_trades:
-            for trade in state.market_trades["market_trades"].get(symbol, []):
-                self.price_history[symbol].append(trade['price'])
-                if len(self.price_history[symbol]) > self.PRICE_WINDOW_SIZE:
-                    self.price_history[symbol].popleft()
-
-    def calculate_average_price(self, symbol):
-        if self.price_history[symbol]:
-            return sum(self.price_history[symbol]) / len(self.price_history[symbol])
-        else:
-            return 0
+        return result, conversions
